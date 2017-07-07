@@ -1,86 +1,151 @@
-'''This needs to be restructured. Modules should have at least access to irc.sendIrc()
-It's abstract enough to where they only need little knowledge of it. Plus it would clean
-this class up a lot. I need a day with no distractions and just do it, we'll see....'''
+#!/usr/bin/python3
+#Main frame
 
 import irc
 import os
 import importlib
 import multiprocessing
-import queue
 import time
+import ssl
+import selectors
+import signal
+import sys
 
 
 class TechBot(irc.Irc):
     def __init__(self):
         '''init this class, and also irc class.'''
         irc.Irc.__init__(self)
-        self.adon_folder = "adons"
-        self.adons = {}
-        self.loadAllAdons()
+        self.addon_folder = "addons"
+        self.addons = {}
+        self.loadAlladdons()
+        self.process_list = []
+        self.prepender = "!"
+        signal.signal(signal.SIGINT, self.sig_handler)
+        print("[+] init finished")
 
+    def loadAddon(self, addon):
+    # dynamically load modules from absolute path
+        try:
+            mod = importlib.import_module('.'.join((self.addon_folder, addon))) #the command prefix 
+            self.addons[addon] = mod # dict key=name value=object handle
+            print("[+] Added %s" % addon)
+        except:
+            e = sys.exc_info()[0]
+            print( "CATCHED ERROR in loadAddon(self, addon): %s" % e )
+            print("[-] addon not found.")
 
-    def loadAllAdons(self):
-        '''adons are in /adons, ignore the cache (python3 lol), loads the dict with
-        key = command/module name and value = module handle to exicute it's main()
+    def loadAlladdons(self):
+        '''addons are in /addons, ignore the cache (python3 lol), loads the dict with
+        key = command/module name and value = module handle to execute it's main()
         ToDo: os.glob would probably be better here.'''
-        adon_names = os.listdir(self.adon_folder)
-        for adon in adon_names:
+        addon_names = os.listdir(self.addon_folder)
+        for addon in addon_names:
             # ignore the cache
-            if adon == "__pycache__":
+            if addon == "__pycache__":
                 continue
-            adon = adon.split('.')[0] # take the .py off
-            # dynamically load modules from absolute path
-            mod = importlib.import_module('.'.join((self.adon_folder, adon)))
-            self.adons[adon] = mod # dict key=name value=object handle
-            
+            addon = addon.split('.')[0] # take the .py off
+            self.loadAddon(addon)
+        print("[+] All addons loaded.")
+
     def handleData(self, data):
         '''Handles on PRIVMSG atm, anything else [I.E.] irc stuff should be handled in the irc class.
-        irc.recvData SHOULD handle disconnects and stuff. irc.recvData SHOULD only return PRIVMSGs but I
-        am tring to push public, this will all eventually change. Module writers will have nothign to worry about thoug.'''
+        Haven't implemented disconnects or rejoins. Also ctc stuff not included yet. But will sometime.
+        Added JOIN, I'm thinking of sending it to an addon to stay modular. Doesn't do anything atm.'''
         if "PRIVMSG" in data:
+            print(data)
             who = data.split(":")[1].split("!")[0].strip()
             msg = data.split(":")[-1].strip()
             where = data.split(":")[1].split("PRIVMSG")[1].strip()
             return (who, msg, where)
+
+        if "NOTICE TechBot :\001VERSION" in data:
+            print(data)
+            who = data.split(":")[1].split("!")[0].strip()
+            info = data.split("VERSION")
+            info = info[-1].strip().strip("\001")
+            self.sendIrc("%s: %s" %(who, info), self.channel)
+
+        if "JOIN :" in data:
+            who = data.split(":")[1].split("!")[0].strip()
+            hostmask = data.split(":")[1].split("JOIN")[0].strip()
+            where = data.split(":")[-1].strip()
+            return("JOIN", who, hostmask, where)
+
         else:
             return data
-            
-    def checkCommand(self, data):
-        '''This checks whether its a command or not and sees if we have a module to
-        handle it.'''
+
+    def checkCommand(self, data, q):
+        '''This checks whether its a command or not and sees if we have a module to handle it.
+        If we do, start a new process, the new process will send results to the queue. Also
+        handles loading and reloading addons.'''
         if type(data) is tuple:
             who = data[0]
             command = data[1]
             chan = data[2]
+            if chan == self.nick:
+                chan = who
             # check if it's a command, then send to approperate command module
-            if command[0] == "!":
-                com = command.split()[0][1:].strip() # get command name minus the !
+            if command[0] == self.prepender:
+                com = command.split()[0][1:].strip() # get command name minus the prepender
                 comargv = " ".join(command.split()[1:]).strip() # get argument/s
-                if com in self.adons.keys():
-                    return (who, comargv, chan, self.adons[com])
-                else:
-                    return "NOT FOUND"
+                if com in self.addons.keys():
+                    com_process = multiprocessing.Process(target=self.addons[com].main, args=(who, comargv, chan, q))
+                    com_process.start()
+                    self.process_list.append(com_process)
+                    print("[+] Found and ran addon %s" % com)
+
+                # load a new addon while running, reloads if already present. Checks if admin/bot owner.
+                elif com == "loadaddon" and who == self.admin:
+                    addon = comargv.strip()
+                    if addon in self.addons.keys():
+                        importlib.reload(self.addons[addon])
+                        print("[+] Reloaded addon.")
+                    else:
+                        self.loadAddon(addon)
+
+    def sig_handler(self, signal, frame):
+        '''Used to catch ctrl-c, so now you can send messages as the bot. Usefull for maitnance such as vhost
+        and nickserv and such. If you want to kill the bot type /exit '''
+        msg = input(">>> ")
+        if msg == "/exit":
+            sys.exit()
+        else:
+            self.sendIrc(msg, self.channel)
 
     def main(self):
         '''This method, since it's main, will be under construction till I'm happy with it.
-        For now, we don't use queues anymore and just pass the send function as an argument to
-        the subprocess. Using SSL is giving some weired errors, so I'm not using it till I can
-        check out pyopenssl or something. I'll file an issue or something soon.'''
+        Went back to using queues. Also using select. SSL issues have been solved. Anything
+        in a queue is to be sent to the irc chan.'''
+        # SimpleQueue because .empty() is safer than regular Queue
+        q = multiprocessing.SimpleQueue()
+        # Python3 recommends using selector instead of select unless you need finer control
+        sel = selectors.DefaultSelector()
+        sel.register(self.sock, selectors.EVENT_READ, self.recvData)
         while True:
-            fulldata = self.recvData()
-            if fulldata:
-                print(fulldata)
-                data = self.handleData(fulldata)
-                check = self.checkCommand(data)
-                if check:
-                    if check == "NOT FOUND":
-                        self.sendIrc("Command not found")
-                        continue # nothing else to do, so go back to main loop
-                    else:
-                        print("Command found and ran")
-                        print(check)
-                        com_process = multiprocessing.Process(target=check[3].main, args=(check[0], check[1], check[2], self.sendIrc))
-                        com_process.start()
+            if not q.empty():
+                d = q.get()
+                # modules can return a tuple to specify who it goes to, or a raw string.
+                if type(d) == tuple:
+                    self.sendIrc(d[0], d[1])
+                else:
+                    #if module sends a raw string, it will go to default channel.
+                    self.sendIrc(d, self.channel)
+
+            event = sel.select(.1) # timeout .1, else it'll block making the queue useless.
+            if event:
+                for key, mask in event:
+                    callback = key.data
+                    fulldata = callback(key.fileobj)
+                if fulldata:
+                    data = self.handleData(fulldata)
+                    check = self.checkCommand(data, q)
+
+            # loop through a copy of the list of sub processes and join any zombies, then remove from list
+            for subproc in self.process_list[:]:
+                if not subproc.is_alive():
+                    subproc.join()
+                    self.process_list.remove(subproc)
 
 # And so we begin.
 if __name__ == "__main__":
